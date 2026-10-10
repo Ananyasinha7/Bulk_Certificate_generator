@@ -1,8 +1,14 @@
 # Bulk Certificate Generator
 
-Backend API that accepts one request with many recipients, renders a PDF certificate per valid recipient, tracks per-item and per-job status, and serves results individually or as a ZIP. A failure on one item never blocks the others.
+Backend API that accepts one request with many recipients, renders a PDF certificate per valid recipient from a single predefined template, tracks per-item and per-job status, and serves the results individually or as a ZIP. A failure on one item never blocks the others.
+
+Stack: Python, FastAPI, SQLAlchemy 2.0 (SQLite by default), Pydantic v2, ReportLab.
+
+A small web UI is included as an optional extra. The API is complete without it.
 
 ## Setup
+
+Requires Python 3.11 or later.
 
 ```
 python -m venv .venv
@@ -10,58 +16,52 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+On Windows PowerShell, activate with `.venv\Scripts\Activate.ps1` instead of the `source` line.
+
 ## Run
 
 ```
 uvicorn app.main:create_app --factory --reload
 ```
 
-The web UI is served at `http://localhost:8000/` and the API docs at `http://localhost:8000/docs`.
+The API is served at `http://localhost:8000/api/v1`, interactive API docs at `http://localhost:8000/docs`, and the web UI at `http://localhost:8000/`.
 
-Configuration is read from the environment or a `.env` file:
+Configuration is read from environment variables or a `.env` file in the project root:
 
-| Variable | Default |
-|---|---|
-| `DATABASE_URL` | `sqlite:///./certificates.db` |
-| `STORAGE_DIR` | `./storage` |
-| `MAX_RECIPIENTS` | `10000` |
-| `RENDER_WORKERS` | CPU count, capped at 8. `1` renders in a thread instead of separate processes |
-| `BATCH_SIZE` | `50` items claimed, rendered and committed together |
+| Variable | Default | Meaning |
+|---|---|---|
+| `DATABASE_URL` | `sqlite:///./certificates.db` | Any SQLAlchemy URL |
+| `STORAGE_DIR` | `./storage` | Where generated PDFs are written |
+| `MAX_RECIPIENTS` | `10000` | Maximum recipients per request |
+| `RENDER_WORKERS` | CPU count, capped at 8 | Rendering processes. `1` renders in a thread instead |
+| `BATCH_SIZE` | `50` | Items claimed, rendered and committed together |
 
-If you ran an earlier version, delete `certificates.db` and the `storage` folder before starting: jobs now store their wording, and the database is created without migrations.
+Example `.env`:
+
+```
+MAX_RECIPIENTS=500
+RENDER_WORKERS=4
+```
+
+The database tables are created on startup. There are no migrations, so delete `certificates.db` after changing the schema during development.
 
 Optional speed-up: `pip install rl_accel` adds C accelerators to ReportLab and cuts render time by roughly a quarter. It is not in `requirements.txt` because it may need a compiler on some platforms.
-## Web UI
-
-The frontend is plain HTML, CSS and ES modules in `app/static`, served by the same FastAPI process. There is no build step.
-
-- **New job:** set the event name, issuer and date, then the wording. Pick a style (Completion, Participation, Achievement, Appreciation) or edit the heading, introduction and statement lines freely; a sketch updates as you type. Paste rows, drop a CSV onto the box or use Upload CSV. The row check flags problems before submitting.
-- **Preview:** "Preview first certificate" renders the exact PDF for the first valid row, with your wording, and lets you generate from the same dialog.
-- **Jobs:** every job on the server, newest first, including jobs created through the API.
-- **Job view:** live progress while processing, filters, pagination, per-certificate PDF download, a ZIP of everything generated, and an export of failed rows as CSV.
-
-## Bulk test
-
-With the server running, in another terminal:
-
-```
-python scripts/bulk_test.py http://127.0.0.1:8000 1000
-```
-
-It submits one job (every 50th row invalid on purpose), polls until it finishes, checks the ZIP contains exactly the succeeded PDFs, and prints a link to open the job in the app. The limit is `MAX_RECIPIENTS` (10,000 by default); the New job page shows it and blocks submitting a longer list.
 
 ## Test
 
 ```
 pytest -q
+```
+
+Tests use a temporary SQLite database and storage directory per test, so they never touch real data. The optional UI has a small set of CSV parsing tests that need Node 20 or later and no dependencies:
+
+```
 npm test
 ```
 
-`npm test` runs the CSV parsing tests with Node 20 or later and needs no dependencies.
+## Submit a certificate generation request
 
-## Usage
-
-Submit a job:
+The examples use `curl` with bash line continuations. In PowerShell, `curl` is an alias for another command, so use Git Bash or WSL, or call `curl.exe`.
 
 ```
 curl -i -X POST http://localhost:8000/api/v1/certificate-jobs \
@@ -75,45 +75,59 @@ curl -i -X POST http://localhost:8000/api/v1/certificate-jobs \
   }'
 ```
 
-The response is `202` with the job `id`, its `status`, `total`, and a `Location` header.
+The response is `202 Accepted` with the job `id`, its `status`, the `total` number of recipients, and a `Location` header pointing at the job.
 
-Check progress:
+`certificate.title` is the event or course name. `heading`, `intro` and `statement` are optional and default to "Certificate of Completion", "This certifies that" and "has successfully completed". The layout itself is always the same.
+
+Invalid recipients (blank or over-long name, malformed email) do not reject the request. They are stored as `FAILED` items with an `error_code` and message. Only a malformed request (wrong shape, empty list, more than `MAX_RECIPIENTS`) returns `422`.
+
+### Check progress
 
 ```
 curl http://localhost:8000/api/v1/certificate-jobs/<job_id>
 ```
 
-List certificates (filter with `status`, paginate with `page` and `page_size`):
+Returns the job status, `total`, `counts` (`pending`, `succeeded`, `failed`), `progress_percent` and timestamps. Example:
+
+```
+{"id": "...", "status": "PROCESSING", "total": 500,
+ "counts": {"pending": 310, "succeeded": 185, "failed": 5}, "progress_percent": 38.0}
+```
+
+List the individual certificates, with the reason for any failure (filter with `status`, paginate with `page` and `page_size`):
 
 ```
 curl "http://localhost:8000/api/v1/certificate-jobs/<job_id>/certificates?status=FAILED"
 ```
-
-List jobs and preview a certificate:
-
-```
-curl "http://localhost:8000/api/v1/certificate-jobs?page=1&page_size=20"
-curl -X POST http://localhost:8000/api/v1/certificate-previews -H "Content-Type: application/json" \\
-  -d '{"certificate": {"title": "Python Bootcamp", "issuer": "Acme Academy", "issue_date": "2026-10-01", "heading": "Certificate of Participation", "intro": "Presented to", "statement": "for attending"}, "recipient_name": "Asha Verma"}' -o preview.pdf
-```
-
-`heading`, `intro` and `statement` are optional on job creation and default to "Certificate of Completion", "This certifies that" and "has successfully completed".
-
-Retrieve results:
-
-```
-curl -O -J http://localhost:8000/api/v1/certificates/<certificate_id>/download
-curl -O -J http://localhost:8000/api/v1/certificate-jobs/<job_id>/download
-```
-
-The first returns one PDF, `404` if unknown, `409` if not generated. The second returns a ZIP of succeeded PDFs, `409` until the job has finished.
 
 Statuses:
 
 - Job: `PENDING`, `PROCESSING`, `COMPLETED`, `COMPLETED_WITH_ERRORS`, `FAILED`
 - Certificate: `PENDING`, `PROCESSING`, `SUCCEEDED`, `FAILED`
 
-Invalid recipients (blank or over-long name, bad email) do not reject the request. They are stored as `FAILED` items with an `error_code` and message. Only a malformed request (wrong shape, empty list, more than `MAX_RECIPIENTS`) returns `422`.
+A job is `COMPLETED` when every item succeeded, `FAILED` when every item failed, and `COMPLETED_WITH_ERRORS` otherwise.
+
+## Retrieve generated certificates
+
+```
+curl -O -J http://localhost:8000/api/v1/certificates/<certificate_id>/download
+curl -O -J http://localhost:8000/api/v1/certificate-jobs/<job_id>/download
+```
+
+The first returns one PDF: `404` if the certificate is unknown, `409` if it was not generated. The second returns a ZIP of the succeeded PDFs only, and `409` until the job has finished. Each item in the certificate list includes a `download_url` when it succeeded.
+
+## Other endpoints
+
+```
+curl "http://localhost:8000/api/v1/certificate-jobs?page=1&page_size=20"
+curl http://localhost:8000/api/v1/limits
+curl -X POST http://localhost:8000/api/v1/certificate-previews \
+  -H "Content-Type: application/json" \
+  -d '{"certificate": {"title": "Python Bootcamp", "issuer": "Acme Academy", "issue_date": "2026-10-01"}, "recipient_name": "Asha Verma"}' \
+  -o preview.pdf
+```
+
+These list jobs newest first, report the configured recipient limit, and render a sample PDF without creating a job.
 
 Every error uses one envelope:
 
@@ -121,13 +135,60 @@ Every error uses one envelope:
 {"error": {"code": "VALIDATION_ERROR", "message": "...", "details": {}}}
 ```
 
-## ADR-002: Batched, parallel rendering
+## Bulk test
 
-Profiling showed rendering costs a few milliseconds per PDF and the rest of the time was two database commits per item. Items are now processed in batches: one atomic `UPDATE ... RETURNING` claims a batch, an executor renders it, files are stored, and a single commit records it. Production uses a spawn-based `ProcessPoolExecutor` so rendering scales across cores; SQLite runs in WAL mode and job creation is one bulk insert. A crash loses at most one in-flight batch, which recovery resets and re-renders. Renderers given to a process pool must be picklable; tests inject a thread executor.
+With the server running, in another terminal:
+
+```
+python scripts/bulk_test.py http://127.0.0.1:8000 1000
+```
+
+It submits one job with every 50th row invalid on purpose, polls until it finishes, checks that the ZIP contains exactly the succeeded PDFs, and prints a link to open the job in the UI. The size is limited by `MAX_RECIPIENTS`.
+
+## Web UI (optional)
+
+The frontend is plain HTML, CSS and ES modules in `app/static`, served by the same FastAPI process with no build step. It can be removed by deleting that folder and the `app.mount` line in `app/main.py`.
+
+- **New job:** set the event name, issuer, date and wording (four style presets, or edit the lines freely), then paste rows or upload a CSV. Problem rows are flagged before submitting, and the recipient limit is shown.
+- **Preview:** renders the exact PDF for the first valid row before generating.
+- **Jobs and job view:** every job newest first, live progress, filters, per-certificate download, a ZIP of everything generated, and an export of failed rows as CSV.
+
+## Project layout
+
+```
+app/
+  main.py            app factory, lifespan, static mount
+  config.py          settings
+  db.py              engine, SQLite WAL, UTC datetime type
+  models.py          CertificateJob, Certificate
+  schemas.py         request and response models
+  errors.py          uniform error envelope
+  deps.py            request-scoped dependencies
+  api/               jobs, certificates, previews, limits routers
+  services/
+    jobs.py          creation, validation, queries, counts
+    processor.py     batched processing, recovery
+    renderer.py      ReportLab PDF rendering
+    storage.py       file storage and ZIP building
+  static/            optional web UI
+tests/               pytest suite
+scripts/bulk_test.py load test against a running server
+```
+
+## Design decisions
+
+- **One template, parameterised.** A single fixed layout is rendered with ReportLab. The job supplies the event name, issuer and date; the heading, introduction and statement lines are optional and default to the standard wording, so the layout never changes.
+- **Per-recipient validation.** Invalid recipients do not reject the request. They are stored as `FAILED` items with an error code, so one bad row never blocks the rest. Only a malformed request returns `422`.
+- **`202` plus polling.** The request returns immediately, generation runs in the background, and the client polls the job. The reasoning and alternatives are in ADR-001.
+- **The database is the source of truth.** Job and per-certificate status live in the database. Counts are computed from rows, so they cannot drift, and a restart resumes unfinished work.
+- **Safe file names.** Files are stored as `{job_id}/{certificate_id}.pdf`, never from user input.
+- **Injectable renderer and executor.** Tests replace the renderer to force a specific failure deterministically, and use a thread executor instead of processes.
+- **Uniform error envelope** on every error path, and 500 responses never leak internals.
+- **Relational database via SQLAlchemy.** SQLite by default; `DATABASE_URL` points it at another database (not tested against PostgreSQL here).
 
 ## ADR-001: Processing model
 
-**Status:** Proposed
+**Status:** Accepted
 
 | Option | Complexity | Durability | Fit |
 |---|---|---|---|
@@ -135,18 +196,29 @@ Profiling showed rendering costs a few milliseconds per PDF and the rest of the 
 | B. Database-tracked items with FastAPI `BackgroundTasks` and startup recovery | Low | Good | Chosen |
 | C. Celery or RQ with Redis | High | Very good | Right for production scale, heavy here |
 
-**Decision:** B. The API persists one row per recipient and returns `202`. The worker processes only `PENDING` items, claiming each with an atomic `UPDATE ... WHERE status = 'PENDING'` and committing per item. The database is the source of truth; the background task is only a trigger. On startup, items stuck in `PROCESSING` are reset to `PENDING` and unfinished jobs are re-enqueued.
+**Decision:** B. The API persists one row per recipient and returns `202`. The worker processes only `PENDING` items, claiming work with an atomic `UPDATE ... WHERE status = 'PENDING'`; see ADR-002 for how items are batched and committed. The database is the source of truth and the background task is only a trigger. On startup, items stuck in `PROCESSING` are reset to `PENDING` and unfinished jobs are re-enqueued.
 
 **Consequences:**
 
-- A crash loses at most one in-flight item, and recovery is safe because only `PENDING` work is processed.
+- A crash loses at most one in-flight batch, and recovery is safe because only `PENDING` work is processed.
 - Progress counts are computed from item rows, so they cannot drift.
 - The worker shares the API process and does not scale horizontally.
 - Upgrade path: replace the `processor` callable with a Celery or RQ enqueue; the processing functions are unchanged.
-- A retry endpoint is a status reset from `FAILED` to `PENDING` plus re-enqueue.
+- A retry endpoint would be a status reset from `FAILED` to `PENDING` plus a re-enqueue.
+
+## ADR-002: Batched, parallel rendering
+
+**Status:** Accepted
+
+Profiling showed that rendering costs a few milliseconds per PDF, and most of the remaining time was two database commits per item. Items are now processed in batches: one atomic `UPDATE ... RETURNING` claims a batch, an executor renders it, files are stored, and a single commit records it. Production uses a spawn-based `ProcessPoolExecutor` so rendering scales across cores, SQLite runs in WAL mode, and job creation is one bulk insert.
+
+- A crash loses at most one in-flight batch, which recovery resets and re-renders. Files are overwritten, never duplicated.
+- Renderers passed to a process pool must be picklable. Tests inject a thread executor so they can use closures.
+- `RENDER_WORKERS=1` renders in a single thread, which is the safe fallback if worker processes cause trouble on a given platform.
 
 ## Limitations
 
-- Certificates use the bundled DejaVu Sans font. Scripts it cannot draw (for example Devanagari) fail that item with `UNSUPPORTED_TEXT`.
-- Authentication is out of scope.
-- Inline PDF preview needs a browser with a built-in PDF viewer. Where there is none, use the "Open PDF in new tab" link in the dialog.
+- Certificates use the bundled DejaVu Sans font. Scripts it cannot draw (for example Devanagari) fail that item with `UNSUPPORTED_TEXT` and a clear message.
+- No authentication or per-client scoping; both are out of scope.
+- No migrations; the schema is created on startup.
+- Inline PDF preview in the web UI needs a browser with a built-in PDF viewer. Where there is none, use the "Open PDF in new tab" link in the preview dialog.
